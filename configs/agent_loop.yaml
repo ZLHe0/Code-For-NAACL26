@@ -1,0 +1,56 @@
+# verl agent-loop registry for the harness serving pipeline (see docs/rl.md).
+#
+# Point verl at this file with
+#   actor_rollout_ref.rollout.agent.agent_loop_config_path=configs/agent_loop.yaml
+#   actor_rollout_ref.rollout.agent.default_agent_loop=harness_<domain>
+# A dataset row may also pick an entry through its `agent_name` column.
+#
+# verl instantiates the `_target_` once per sample and passes every other key of the entry to its
+# constructor. Keys under the trainer config's top-level `harness_programs:` block override these, so the
+# per-run settings (budget, program, run directory) live in configs/grpo_*.yaml and the entries
+# here only fix what belongs to the domain.
+#
+# Recognized keys (harness_programs.rl.agent_loop.LoopSettings):
+#   domain               codesearch | sql | alfworld | toy
+#   domain_options       field overrides for the domain dataclass, e.g. {reason: true}
+#   trace_mode           per_turn | merged | auto (auto = per_turn exactly when the budget is on)
+#   context_budget       {enable, history_budget, trim_overflow}
+#   program_path         program.json served by the pipeline (compression + triggers)
+#   program_dynamic      the program may appear or change mid-run; serve without it until then
+#   max_turns            turn cap when rollout.multi_turn.max_assistant_turns is unset
+#   per_turn_max_tokens  generation cap for one turn (default: rollout response_length)
+#   max_per_episode, max_per_trigger   caps on trigger firings (0 = no cap)
+#   run_dir              step marker is read from, and episode dumps written to, this directory
+#   dump_episodes        append every episode to <run_dir>/rollouts/step_<N>.jsonl
+#   tasks_path           task file for rows that carry only extra_info.task_id
+#   require_multi_output_patch   refuse per-turn traces on a verl without the multi-output change
+
+- name: harness_codesearch
+  _target_: harness_programs.rl.agent_loop.HarnessAgentLoop
+  domain: codesearch
+  domain_options:
+    reason: true
+  max_turns: 10
+  per_turn_max_tokens: 1024
+
+- name: harness_sql
+  _target_: harness_programs.rl.agent_loop.HarnessAgentLoop
+  domain: sql
+  domain_options:
+    reason: true
+  max_turns: 6
+  per_turn_max_tokens: 512
+
+- name: harness_alfworld
+  _target_: harness_programs.rl.agent_loop.HarnessAgentLoop
+  domain: alfworld
+  # The game data root comes from $ALFWORLD_DATA on the rollout workers unless set here,
+  # e.g. domain_options: {data_dir: <alfworld data root>}.
+  max_turns: 50
+  per_turn_max_tokens: 512
+
+- name: harness_toy
+  _target_: harness_programs.rl.agent_loop.HarnessAgentLoop
+  domain: toy
+  max_turns: 8
+  per_turn_max_tokens: 256

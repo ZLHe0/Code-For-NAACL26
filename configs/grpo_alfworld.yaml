@@ -1,0 +1,108 @@
+# GRPO on ALFWorld with the harness serving pipeline in the loop. See docs/rl.md.
+#
+#   export MODEL_PATH=<base model> RUN_DIR=<run directory> DATA_DIR=<dataset directory>
+#   python -m verl.trainer.main_ppo --config-path="$PWD/configs" --config-name=grpo_alfworld
+#
+# ${MODEL_PATH}, ${RUN_DIR} and ${DATA_DIR} resolve from the environment through the three
+# top-level keys below; override them on the command line instead (RUN_DIR=...) if you prefer,
+# or render a literal copy with envsubst '${MODEL_PATH} ${RUN_DIR} ${DATA_DIR}'.
+# Run from the repository root so configs/agent_loop.yaml resolves. The rollout workers need
+# the alfworld package and $ALFWORLD_DATA (or domain_options.data_dir in agent_loop.yaml).
+#
+# Values are those of the paper's ALFWorld runs (Qwen2.5-3B-Instruct / Qwen2.5-7B-Instruct, 200
+# steps, one node of 8 GPUs). The template is the E=1024 arm; the arm with no history budget
+# (E=null: the pipeline still serves, capped only by the model window) differs where marked.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+MODEL_PATH: ${oc.env:MODEL_PATH}
+RUN_DIR: ${oc.env:RUN_DIR}
+DATA_DIR: ${oc.env:DATA_DIR}
+
+# Read by harness_programs.rl.agent_loop; overrides the agent-loop entry in configs/agent_loop.yaml.
+harness_programs:
+  trace_mode: per_turn             # one training row per turn (docs/rl.md, "Traces")
+  context_budget:
+    enable: true                   # false (and drop program_path) = the unmanaged baseline
+    history_budget: 1024             # E. E=null: null
+  program_path: ${RUN_DIR}/program.json   # stage-1 output; the steering supervisor adds triggers
+  program_dynamic: true            # serve without a program until the file exists
+  run_dir: ${RUN_DIR}              # step marker + rollouts/step_<N>.jsonl
+
+data:
+  train_files: ${DATA_DIR}/alfworld/train.parquet   # rows from harness_programs.rl.agent_loop.make_rows
+  val_files: ${DATA_DIR}/alfworld/val.parquet
+  train_batch_size: 16             # tasks per step
+  max_prompt_length: 2048          # longest served prompt. E=null: 12288
+  max_response_length: 2048        # per-turn traces carry one turn each (cap: per_turn_max_tokens)
+  return_raw_chat: true
+  filter_overlong_prompts: true
+  truncation: error
+  shuffle: true
+  apply_chat_template_kwargs:
+    enable_thinking: false     # inert for templates without a reasoning branch
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+actor_rollout_ref:
+  model:
+    path: ${MODEL_PATH}
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+  actor:
+    optim:
+      lr: 1.0e-6
+    ppo_mini_batch_size: 16        # = train_batch_size: one optimizer step per training step
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 4096   # max_prompt_length + max_response_length. E=null: 14336
+    use_kl_loss: true
+    kl_loss_coef: 0.01
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0.001
+    use_torch_compile: false
+    ulysses_sequence_parallel_size: 1
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+  rollout:
+    name: vllm
+    mode: async
+    n: 8                           # GRPO group size
+    temperature: 0.6
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    calculate_log_probs: true
+    max_model_len: 16384           # E=null: 32768
+    max_num_batched_tokens: 16384  # E=null: 32768
+    max_num_seqs: 256
+    log_prob_micro_batch_size_per_gpu: 1
+    multi_turn:
+      max_assistant_turns: 50
+    # Validation uses verl's default greedy decoding (val_kwargs: temperature 0, n 1).
+    agent:
+      default_agent_loop: harness_alfworld
+      agent_loop_config_path: configs/agent_loop.yaml
+
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 8
+  total_training_steps: 200
+  total_epochs: 200                # large enough that the step count is what stops training
+  save_freq: 25
+  test_freq: 5                     # E=null: 10
+  val_before_train: true
+  log_val_generations: 10
+  logger: [console, tensorboard]
+  project_name: harness_programs
+  experiment_name: alfworld_grpo
+  default_local_dir: ${RUN_DIR}/checkpoints
